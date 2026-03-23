@@ -1,0 +1,3 @@
+name = "git-lfs-s3-proxy"
+main = "_worker.js"   # hoặc index.js
+compatibility_date = "2026-03-23"
