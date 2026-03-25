@@ -104,10 +104,16 @@ async function fetch(req, env) {
     );
   }
 
-  // ── DELETE /locks/:id  or  /locks/:id/unlock ────────────────────────────────
-  const unlockMatch = url.pathname.match(/\/locks\/([^/]+)(?:\/unlock)?$/);
-  if (unlockMatch && req.method === "DELETE") {
+  // ── POST /locks/:id/unlock  or  DELETE /locks/:id ───────────────────────────
+  const unlockMatch = url.pathname.match(/\/locks\/([^/]+)(\/unlock)?$/);
+  if (unlockMatch) {
     const id = unlockMatch[1];
+    const isPostUnlock = unlockMatch[2] === "/unlock" && req.method === "POST";
+    const isDelete = !unlockMatch[2] && req.method === "DELETE";
+
+    if (!isPostUnlock && !isDelete)
+      return new Response(null, { status: 405, headers: { Allow: "POST, DELETE" } });
+
     const lock = await getLockById(env, repo, id);
 
     if (!lock)
@@ -116,7 +122,8 @@ async function fetch(req, env) {
         { status: 404, headers: { "Content-Type": MIME } }
       );
 
-    const { force } = await req.json().catch(() => ({}));
+    const body = await req.json().catch(() => ({}));
+    const force = body?.force ?? false;
 
     if (lock.owner?.name !== user && !force)
       return new Response(
@@ -136,7 +143,6 @@ async function fetch(req, env) {
     const pathFilter = url.searchParams.get("path");
     const idFilter = url.searchParams.get("id");
 
-    // Nếu filter theo path → lookup trực tiếp, không cần scan
     if (pathFilter) {
       const lock = await getLockByPath(env, repo, pathFilter);
       return new Response(
@@ -145,7 +151,6 @@ async function fetch(req, env) {
       );
     }
 
-    // Nếu filter theo id → lookup trực tiếp
     if (idFilter) {
       const lock = await getLockById(env, repo, idFilter);
       return new Response(
@@ -154,7 +159,6 @@ async function fetch(req, env) {
       );
     }
 
-    // Không có filter → trả về tất cả
     const allLocks = await listLocks(env, repo);
     return new Response(
       JSON.stringify({ locks: allLocks }),
@@ -166,7 +170,6 @@ async function fetch(req, env) {
   if (url.pathname.endsWith("/locks") && req.method === "POST") {
     const { path } = await req.json();
 
-    // Lookup trực tiếp theo path — không bị race condition
     const conflict = await getLockByPath(env, repo, path);
     if (conflict)
       return new Response(
