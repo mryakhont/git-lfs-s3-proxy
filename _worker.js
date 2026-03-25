@@ -25,18 +25,18 @@ function parseAuthorization(req) {
   return { user: decoded.slice(0, index), pass: decoded.slice(index + 1) };
 }
 
-// ── Lock helpers ─────────────────────────────────────────────────────────────
+// ── Lock helpers ──────────────────────────────────────────────────────────────
 
-function lockKey(repo, id) {
-  return `lock:${repo}:${id}`;
+function lockKeyById(repo, id) {
+  return `lock:${repo}:id:${id}`;
 }
 
-function repoPrefix(repo) {
-  return `lock:${repo}:`;
+function lockKeyByPath(repo, path) {
+  return `lock:${repo}:path:${encodeURIComponent(path)}`;
 }
 
 async function listLocks(env, repo) {
-  const list = await env.LFS_LOCKS.list({ prefix: repoPrefix(repo) });
+  const list = await env.LFS_LOCKS.list({ prefix: `lock:${repo}:id:` });
   const locks = await Promise.all(
     list.keys.map(async ({ name }) => {
       const val = await env.LFS_LOCKS.get(name);
@@ -44,6 +44,31 @@ async function listLocks(env, repo) {
     })
   );
   return locks.filter(Boolean);
+}
+
+async function getLockByPath(env, repo, path) {
+  const val = await env.LFS_LOCKS.get(lockKeyByPath(repo, path));
+  return val ? JSON.parse(val) : null;
+}
+
+async function getLockById(env, repo, id) {
+  const val = await env.LFS_LOCKS.get(lockKeyById(repo, id));
+  return val ? JSON.parse(val) : null;
+}
+
+async function saveLock(env, repo, lock) {
+  const data = JSON.stringify(lock);
+  await Promise.all([
+    env.LFS_LOCKS.put(lockKeyById(repo, lock.id), data),
+    env.LFS_LOCKS.put(lockKeyByPath(repo, lock.path), data),
+  ]);
+}
+
+async function deleteLock(env, repo, lock) {
+  await Promise.all([
+    env.LFS_LOCKS.delete(lockKeyById(repo, lock.id)),
+    env.LFS_LOCKS.delete(lockKeyByPath(repo, lock.path)),
+  ]);
 }
 
 function getRepo(pathname) {
@@ -83,16 +108,14 @@ async function fetch(req, env) {
   const unlockMatch = url.pathname.match(/\/locks\/([^/]+)(?:\/unlock)?$/);
   if (unlockMatch && req.method === "DELETE") {
     const id = unlockMatch[1];
-    const key = lockKey(repo, id);
-    const existing = await env.LFS_LOCKS.get(key);
+    const lock = await getLockById(env, repo, id);
 
-    if (!existing)
+    if (!lock)
       return new Response(
         JSON.stringify({ message: "Lock not found" }),
         { status: 404, headers: { "Content-Type": MIME } }
       );
 
-    const lock = JSON.parse(existing);
     const { force } = await req.json().catch(() => ({}));
 
     if (lock.owner?.name !== user && !force)
@@ -101,7 +124,7 @@ async function fetch(req, env) {
         { status: 403, headers: { "Content-Type": MIME } }
       );
 
-    await env.LFS_LOCKS.delete(key);
+    await deleteLock(env, repo, lock);
     return new Response(
       JSON.stringify({ lock }),
       { status: 200, headers: { "Content-Type": MIME } }
@@ -110,18 +133,31 @@ async function fetch(req, env) {
 
   // ── GET /locks ──────────────────────────────────────────────────────────────
   if (url.pathname.endsWith("/locks") && req.method === "GET") {
-    const allLocks = await listLocks(env, repo);
-
     const pathFilter = url.searchParams.get("path");
     const idFilter = url.searchParams.get("id");
-    const filtered = allLocks.filter((l) => {
-      if (pathFilter && l.path !== pathFilter) return false;
-      if (idFilter && l.id !== idFilter) return false;
-      return true;
-    });
 
+    // Nếu filter theo path → lookup trực tiếp, không cần scan
+    if (pathFilter) {
+      const lock = await getLockByPath(env, repo, pathFilter);
+      return new Response(
+        JSON.stringify({ locks: lock ? [lock] : [] }),
+        { status: 200, headers: { "Content-Type": MIME } }
+      );
+    }
+
+    // Nếu filter theo id → lookup trực tiếp
+    if (idFilter) {
+      const lock = await getLockById(env, repo, idFilter);
+      return new Response(
+        JSON.stringify({ locks: lock ? [lock] : [] }),
+        { status: 200, headers: { "Content-Type": MIME } }
+      );
+    }
+
+    // Không có filter → trả về tất cả
+    const allLocks = await listLocks(env, repo);
     return new Response(
-      JSON.stringify({ locks: filtered }),
+      JSON.stringify({ locks: allLocks }),
       { status: 200, headers: { "Content-Type": MIME } }
     );
   }
@@ -130,8 +166,8 @@ async function fetch(req, env) {
   if (url.pathname.endsWith("/locks") && req.method === "POST") {
     const { path } = await req.json();
 
-    const allLocks = await listLocks(env, repo);
-    const conflict = allLocks.find((l) => l.path === path);
+    // Lookup trực tiếp theo path — không bị race condition
+    const conflict = await getLockByPath(env, repo, path);
     if (conflict)
       return new Response(
         JSON.stringify({ message: "already locked", lock: conflict }),
@@ -145,7 +181,7 @@ async function fetch(req, env) {
       owner: { name: user },
     };
 
-    await env.LFS_LOCKS.put(lockKey(repo, lock.id), JSON.stringify(lock));
+    await saveLock(env, repo, lock);
 
     return new Response(
       JSON.stringify({ lock }),
