@@ -74,4 +74,53 @@ async function fetch(req, env) {
   if (req.method !== "POST")
     return new Response(null, { status: 405, headers: { Allow: "POST" } });
 
-  const { user, pass } = pa
+  const { user, pass } = parseAuthorization(req);
+  let s3Options = { accessKeyId: user, secretAccessKey: pass };
+
+  const segments = url.pathname.split("/").slice(1, -2);
+  let bucketIdx = 0;
+  for (const segment of segments) {
+    const sliceIdx = segment.indexOf("=");
+    if (sliceIdx === -1) break;
+    s3Options[decodeURIComponent(segment.slice(0, sliceIdx))] =
+      decodeURIComponent(segment.slice(sliceIdx + 1));
+    bucketIdx++;
+  }
+
+  const s3 = new AwsClient(s3Options);
+  const bucket = segments.slice(bucketIdx).join("/");
+  const expires_in = env.EXPIRY || EXPIRY;
+  const { objects, operation, hash_algo = "sha256" } = await req.json();
+
+  if (hash_algo !== "sha256")
+    return new Response(
+      JSON.stringify({ message: `Hash algorithm '${hash_algo}' is not supported.` }),
+      { status: 409, headers: { "Content-Type": MIME } }
+    );
+
+  const method = METHOD_FOR[operation];
+  const response = JSON.stringify({
+    transfer: "basic",
+    hash_algo: "sha256",
+    objects: await Promise.all(
+      objects.map(async ({ oid, size }) => ({
+        oid,
+        size,
+        authenticated: true,
+        actions: {
+          [operation]: {
+            href: await sign(s3, bucket, oid, method),
+            expires_in,
+          },
+        },
+      })),
+    ),
+  });
+
+  return new Response(response, {
+    status: 200,
+    headers: { "Cache-Control": "no-store", "Content-Type": MIME },
+  });
+}
+
+export default { fetch };
