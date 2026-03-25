@@ -6,3 +6,6 @@ compatibility_date = "2026-03-23"
 binding = "LFS_BUCKET"
 bucket_name = "metanote-lfs-storage"
 preview_bucket_name = "metanote-lfs-storage"
+[[kv_namespaces]]
+binding = "LFS_LOCKS"
+id = "0e8769810a3141b79d3367d34a92a556"
