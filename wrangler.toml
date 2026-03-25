@@ -1,3 +1,8 @@
 name = "git-lfs-s3-proxy"
 main = "_worker.js"   # hoặc index.js
 compatibility_date = "2026-03-23"
+# R2 bucket binding
+[[r2_buckets]]
+binding = "LFS_BUCKET"
+bucket_name = "metanote-lfs-storage"
+preview_bucket_name = "metanote-lfs-storage"
