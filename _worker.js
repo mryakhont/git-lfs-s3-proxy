@@ -25,6 +25,33 @@ function parseAuthorization(req) {
   return { user: decoded.slice(0, index), pass: decoded.slice(index + 1) };
 }
 
+// ── Lock helpers ─────────────────────────────────────────────────────────────
+
+function lockKey(repo, id) {
+  return `lock:${repo}:${id}`;
+}
+
+function repoPrefix(repo) {
+  return `lock:${repo}:`;
+}
+
+async function listLocks(env, repo) {
+  const list = await env.LFS_LOCKS.list({ prefix: repoPrefix(repo) });
+  const locks = await Promise.all(
+    list.keys.map(async ({ name }) => {
+      const val = await env.LFS_LOCKS.get(name);
+      return val ? JSON.parse(val) : null;
+    })
+  );
+  return locks.filter(Boolean);
+}
+
+function getRepo(pathname) {
+  return pathname.replace(/\/(locks.*|objects\/batch)$/, "");
+}
+
+// ── Main handler ──────────────────────────────────────────────────────────────
+
 async function fetch(req, env) {
   const url = new URL(req.url);
 
@@ -34,48 +61,112 @@ async function fetch(req, env) {
       : new Response(null, { status: 405, headers: { Allow: "GET" } });
   }
 
-  // ── Locks API ──────────────────────────────────────────────────────────────
+  const { user } = parseAuthorization(req);
+  const repo = getRepo(url.pathname);
+
+  // ── POST /locks/verify ──────────────────────────────────────────────────────
   if (url.pathname.endsWith("/locks/verify")) {
     if (req.method !== "POST")
       return new Response(null, { status: 405, headers: { Allow: "POST" } });
+
+    const allLocks = await listLocks(env, repo);
+    const ours = allLocks.filter((l) => l.owner?.name === user);
+    const theirs = allLocks.filter((l) => l.owner?.name !== user);
+
     return new Response(
-      JSON.stringify({ ours: [], theirs: [] }),
+      JSON.stringify({ ours, theirs }),
       { status: 200, headers: { "Content-Type": MIME } }
     );
   }
 
-  if (url.pathname.endsWith("/locks")) {
-    if (req.method === "GET")
-      return new Response(
-        JSON.stringify({ locks: [] }),
-        { status: 200, headers: { "Content-Type": MIME } }
-      );
-    if (req.method === "POST")
-      return new Response(
-        JSON.stringify({ message: "Locking is not supported by this LFS server." }),
-        { status: 501, headers: { "Content-Type": MIME } }
-      );
-    return new Response(null, { status: 405, headers: { Allow: "GET, POST" } });
-  }
+  // ── DELETE /locks/:id  or  /locks/:id/unlock ────────────────────────────────
+  const unlockMatch = url.pathname.match(/\/locks\/([^/]+)(?:\/unlock)?$/);
+  if (unlockMatch && req.method === "DELETE") {
+    const id = unlockMatch[1];
+    const key = lockKey(repo, id);
+    const existing = await env.LFS_LOCKS.get(key);
 
-  if (/\/locks\/[^/]+(\/unlock)?$/.test(url.pathname)) {
-    if (req.method !== "DELETE")
-      return new Response(null, { status: 405, headers: { Allow: "DELETE" } });
+    if (!existing)
+      return new Response(
+        JSON.stringify({ message: "Lock not found" }),
+        { status: 404, headers: { "Content-Type": MIME } }
+      );
+
+    const lock = JSON.parse(existing);
+    const { force } = await req.json().catch(() => ({}));
+
+    if (lock.owner?.name !== user && !force)
+      return new Response(
+        JSON.stringify({ message: "You do not own this lock", lock }),
+        { status: 403, headers: { "Content-Type": MIME } }
+      );
+
+    await env.LFS_LOCKS.delete(key);
     return new Response(
-      JSON.stringify({ message: "Locking is not supported by this LFS server." }),
-      { status: 501, headers: { "Content-Type": MIME } }
+      JSON.stringify({ lock }),
+      { status: 200, headers: { "Content-Type": MIME } }
     );
   }
-  // ──────────────────────────────────────────────────────────────────────────
 
+  // ── GET /locks ──────────────────────────────────────────────────────────────
+  if (url.pathname.endsWith("/locks") && req.method === "GET") {
+    const allLocks = await listLocks(env, repo);
+
+    const pathFilter = url.searchParams.get("path");
+    const idFilter = url.searchParams.get("id");
+    const filtered = allLocks.filter((l) => {
+      if (pathFilter && l.path !== pathFilter) return false;
+      if (idFilter && l.id !== idFilter) return false;
+      return true;
+    });
+
+    return new Response(
+      JSON.stringify({ locks: filtered }),
+      { status: 200, headers: { "Content-Type": MIME } }
+    );
+  }
+
+  // ── POST /locks (tạo lock mới) ──────────────────────────────────────────────
+  if (url.pathname.endsWith("/locks") && req.method === "POST") {
+    const { path } = await req.json();
+
+    const allLocks = await listLocks(env, repo);
+    const conflict = allLocks.find((l) => l.path === path);
+    if (conflict)
+      return new Response(
+        JSON.stringify({ message: "already locked", lock: conflict }),
+        { status: 409, headers: { "Content-Type": MIME } }
+      );
+
+    const lock = {
+      id: crypto.randomUUID().replace(/-/g, "").slice(0, 16),
+      path,
+      locked_at: new Date().toISOString(),
+      owner: { name: user },
+    };
+
+    await env.LFS_LOCKS.put(lockKey(repo, lock.id), JSON.stringify(lock));
+
+    return new Response(
+      JSON.stringify({ lock }),
+      { status: 201, headers: { "Content-Type": MIME } }
+    );
+  }
+
+  // ── POST /objects/batch ─────────────────────────────────────────────────────
   if (!url.pathname.endsWith("/objects/batch"))
     return new Response(null, { status: 404 });
 
   if (req.method !== "POST")
     return new Response(null, { status: 405, headers: { Allow: "POST" } });
 
-  const { user, pass } = parseAuthorization(req);
-  let s3Options = { accessKeyId: user, secretAccessKey: pass };
+  const { user: accessKey, pass: secretKey } = parseAuthorization(req);
+  let s3Options = {
+    accessKeyId: accessKey,
+    secretAccessKey: secretKey,
+    region: "auto",
+    service: "s3",
+  };
 
   const segments = url.pathname.split("/").slice(1, -2);
   let bucketIdx = 0;
